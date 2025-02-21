@@ -1195,8 +1195,14 @@ class VadStreamingSatellite(SatelliteBase):
 # -----------------------------------------------------------------------------
 
 
+
+
+
+_LOGGER = logging.getLogger(__name__)
+_WAKE_INFO_TIMEOUT = 5.0
+
 class WakeStreamingSatellite(SatelliteBase):
-    """Satellite that waits for local wake word detection before streaming."""
+    """Satellite that waits for local wake word detection before streaming, with follow-up response handling."""
 
     def __init__(self, settings: SatelliteSettings) -> None:
         if not settings.wake.enabled:
@@ -1204,25 +1210,34 @@ class WakeStreamingSatellite(SatelliteBase):
 
         super().__init__(settings)
         self.is_streaming = False
-
-        # Timestamp in the future when the refractory period is over (set with
-        # time.monotonic()).
+        self.awaiting_response = False  # Flag for follow-up interactions
+        self.is_speaking = False       # Flag to indicate if the assistant is speaking
+        self.last_synthesize_text = None  # Store the last synthesized text
+        # Timestamp in the future when the refractory period is over (set with time.monotonic()).
         # wake word id -> seconds
         self.refractory_timestamp: Dict[Optional[str], float] = {}
 
         if settings.vad.enabled:
             _LOGGER.warning("VAD is enabled but will not be used")
 
-        # Used for debug audio recording so both wake and stt WAV files have the
-        # same timestamp.
+        # Used for debug audio recording so both wake and stt WAV files have the same timestamp.
         self._debug_recording_timestamp: Optional[int] = None
-
         self._is_paused = False
-
         self._wake_info: Optional[Info] = None
         self._wake_info_ready = asyncio.Event()
+        
 
     async def event_from_server(self, event: Event) -> None:
+        print(self.is_speaking)
+        """Handle events from the server, managing streaming and conversation state."""
+        # Capture the assistant's synthesized text and set speaking flag
+        if Synthesize.is_type(event.type):
+            synthesize = Synthesize.from_event(event)
+            self.last_synthesize_text = synthesize.text
+            self.is_speaking = True  # Set when assistant starts speaking
+            self.microphone_muted = True  # Actively mute microphone during TTS
+            _LOGGER.debug("Last synthesized text: %s", self.last_synthesize_text)
+
         # Only check event types once
         is_run_satellite = False
         is_pause_satellite = False
@@ -1232,7 +1247,6 @@ class WakeStreamingSatellite(SatelliteBase):
         if RunSatellite.is_type(event.type):
             is_run_satellite = True
             self._is_paused = False
-
         elif PauseSatellite.is_type(event.type):
             is_pause_satellite = True
         elif Transcript.is_type(event.type):
@@ -1241,58 +1255,63 @@ class WakeStreamingSatellite(SatelliteBase):
             is_error = True
 
         if is_transcript or is_pause_satellite:
-            # Stop streaming before event_from_server is called because it will
-            # play the "done" WAV.
+            # Stop streaming before event_from_server is called because it will play the "done" WAV.
             self.is_streaming = False
-
-            # Stop debug recording (stt)
             if self.stt_audio_writer is not None:
                 self.stt_audio_writer.stop()
 
+        # Call the base class method
         await super().event_from_server(event)
 
         if is_run_satellite or is_transcript or is_error or is_pause_satellite:
             # Stop streaming
             self.is_streaming = False
-
+            if is_transcript or is_error:
+                self.awaiting_response = False  # Reset after processing response or error
             if is_pause_satellite:
                 self._is_paused = True
                 _LOGGER.debug("Satellite is paused")
             else:
                 # Go back to wake word detection
                 await self.trigger_streaming_stop()
-
-                # It's possible to be paused in the middle of streaming
                 if not self._is_paused:
                     await self._send_wake_detect()
                     _LOGGER.info("Waiting for wake word")
-
-                    # Start debug recording (wake)
                     self._debug_recording_timestamp = time.monotonic_ns()
                     if self.wake_audio_writer is not None:
-                        self.wake_audio_writer.start(
-                            timestamp=self._debug_recording_timestamp
-                        )
+                        self.wake_audio_writer.start(timestamp=self._debug_recording_timestamp)
 
-    async def trigger_server_disonnected(self) -> None:
-        await super().trigger_server_disonnected()
+    async def trigger_tts_stop(self) -> None:
+        print(self.is_speaking)
+        """Handle the end of TTS playback, setting awaiting_response if the assistant asked a question."""
+        self.is_speaking = False  # Set when assistant stops speaking
+        self.microphone_muted = False  # Unmute microphone after TTS
+        await super().trigger_tts_stop()
 
+        # Introduce a brief delay to let residual TTS audio subside.
+        await asyncio.sleep(0.5) 
+
+        # if self.last_synthesize_text and self.last_synthesize_text.strip().endswith("?"):
+        if self.last_synthesize_text and "?" in self.last_synthesize_text.strip():
+            self.awaiting_response = True
+            _LOGGER.info("Awaiting user response after question")
+        else:
+            self.awaiting_response = False
+
+    async def trigger_server_disconnected(self) -> None:
+        """Handle server disconnection."""
+        await super().trigger_server_disconnected()
         self.is_streaming = False
-
-        # Stop debug recording (stt)
         if self.stt_audio_writer is not None:
             self.stt_audio_writer.stop()
-
         await self.trigger_streaming_stop()
 
-    async def event_from_mic(
-        self, event: Event, audio_bytes: Optional[bytes] = None
-    ) -> None:
-        if (
-            (not AudioChunk.is_type(event.type))
-            or self.microphone_muted
-            or self._is_paused
-        ):
+    async def event_from_mic(self, event: Event, audio_bytes: Optional[bytes] = None) -> None:
+        """Handle microphone events, streaming based on conversation state."""
+        if self.is_speaking:
+            return  # Ignore microphone input while assistant is speaking
+
+        if not AudioChunk.is_type(event.type) or self.microphone_muted or self._is_paused:
             return
 
         # Debug audio recording
@@ -1300,14 +1319,22 @@ class WakeStreamingSatellite(SatelliteBase):
             if audio_bytes is None:
                 chunk = AudioChunk.from_event(event)
                 audio_bytes = chunk.audio
-
             if self.wake_audio_writer is not None:
                 self.wake_audio_writer.write(audio_bytes)
-
             if self.stt_audio_writer is not None:
                 self.stt_audio_writer.write(audio_bytes)
 
         if self.is_streaming:
+            # Forward to server
+            await self.event_to_server(event)
+        elif self.awaiting_response:
+            # Simulate wake word detection for follow-up
+            self.is_streaming = True
+            _LOGGER.debug("Simulating wake word detection for follow-up")
+            fake_detection = Detection(name="hey_jarvis")
+            await self.event_to_server(fake_detection.event())
+            await self._send_run_pipeline()
+            await self.trigger_streaming_start()
             # Forward to server
             await self.event_to_server(event)
         else:
@@ -1315,6 +1342,7 @@ class WakeStreamingSatellite(SatelliteBase):
             await self.event_to_wake(event)
 
     async def event_from_wake(self, event: Event) -> None:
+        """Handle wake word events, initiating streaming."""
         if Info.is_type(event.type):
             self._wake_info = Info.from_event(event)
             self._wake_info_ready.set()
@@ -1326,12 +1354,9 @@ class WakeStreamingSatellite(SatelliteBase):
 
         if Detection.is_type(event.type):
             detection = Detection.from_event(event)
-
             # Check refractory period to avoid multiple back-to-back detections
             refractory_timestamp = self.refractory_timestamp.get(detection.name)
-            if (refractory_timestamp is not None) and (
-                refractory_timestamp > time.monotonic()
-            ):
+            if (refractory_timestamp is not None) and (refractory_timestamp > time.monotonic()):
                 _LOGGER.debug("Wake word detection occurred during refractory period")
                 return
 
@@ -1344,13 +1369,11 @@ class WakeStreamingSatellite(SatelliteBase):
                 self.stt_audio_writer.start(timestamp=self._debug_recording_timestamp)
 
             _LOGGER.debug(detection)
-
             self.is_streaming = True
             _LOGGER.debug("Streaming audio")
 
             if self.settings.wake.refractory_seconds is not None:
-                # Another detection may not occur for this wake word until
-                # refractory period is over.
+                # Another detection may not occur for this wake word until refractory period is over.
                 self.refractory_timestamp[detection.name] = (
                     time.monotonic() + self.settings.wake.refractory_seconds
                 )
@@ -1376,15 +1399,13 @@ class WakeStreamingSatellite(SatelliteBase):
             await self.trigger_streaming_start()
 
     async def update_info(self, info: Info) -> None:
+        """Update wake service info."""
         self._wake_info = None
         self._wake_info_ready.clear()
         await self.event_to_wake(Describe().event())
 
         try:
-            await asyncio.wait_for(
-                self._wake_info_ready.wait(), timeout=_WAKE_INFO_TIMEOUT
-            )
-
+            await asyncio.wait_for(self._wake_info_ready.wait(), timeout=_WAKE_INFO_TIMEOUT)
             if self._wake_info is not None:
                 # Update wake info only
                 info.wake = self._wake_info.wake
